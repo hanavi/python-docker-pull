@@ -6,14 +6,15 @@ import gzip
 import json
 import hashlib
 import shutil
-import requests
 import tarfile
 import urllib3
 import pathlib
 
+from dataclasses import dataclass
 from argparse import ArgumentParser
 from io import BytesIO
 
+import requests
 import click
 
 urllib3.disable_warnings()
@@ -29,7 +30,7 @@ class URLData:
 
 
 @dataclass
-class ImageData
+class ImageData:
     imgparts: str
     registry: str
     repo: str
@@ -43,11 +44,12 @@ class ImageData
 
     @property
     def manifest_url(self):
-        return f'{self.base_url}/{repository}/manifests/{tag}'
+        return f'{self.base_url}/{self.repository}/manifests/{self.tag}'
 
     @property
     def blobs_url(self):
-        return f'{self.base_url}/{repository}/blobs'
+        return f'{self.base_url}/{self.repository}/blobs'
+
 
 def get_auth_head(url_data):
     """Get Docker token.
@@ -169,9 +171,9 @@ def manifest_error(resp, url_data, image_data):
     sys.exit(1)
 
 
-def get_base_dict():
+def get_base_json():
 
-    container_config: {
+    container_config = {
         "Hostname": "",
         "Domainname": "",
         "User": "",
@@ -198,6 +200,7 @@ def get_base_dict():
 
     return json.dumps(empty_dict)
 
+
 def get_url_data(image_data):
 
     # Get Docker authentication endpoint when it is required
@@ -219,18 +222,20 @@ def get_url_data(image_data):
     url_data = URLData(
         auth_url=auth_url,
         reg_service=reg_service,
-        repository=repository,
+        repository=image_data.repository,
         auth_type=auth_type,
     )
 
     return url_data
 
-def save_chunks(layerdir, bresp, nb_traits):
+
+def save_chunks(layerdir, bresp, ublob, nb_traits):
 
     unit = int(bresp.headers['Content-Length']) / 50
     acc = 0
 
-    with open(layerdir + '/layer_gzip.tar', "wb") as file:
+    layer_file = layerdir / 'layer_gzip.tar'
+    with open(layer_file, "wb") as file:
 
         for chunk in bresp.iter_content(chunk_size=CHUNK_SIZE):
 
@@ -266,7 +271,18 @@ def layer_error(layer, auth_head):
     sys.exit(1)
 
 
-def func_layers(layers):
+def get_fake_layerid():
+
+    # FIXME: Creating fake layer ID. Don't know how Docker generates it
+    fake_layerid = "{parentid}\n"
+    fake_layerid += "{ublob}\n"
+    fake_layerid = fake_layerid.encode('utf-8')
+    fake_layerid = hashlib.sha256(fake_layerid)
+    fake_layerid = fake_layerid.hexdigest()
+    return fake_layerid
+
+
+def func_layers(layers, url_data, image_data, imgdir, content, confresp):
 
     # TODO: better function name...
 
@@ -275,13 +291,7 @@ def func_layers(layers):
     for layer in layers:
 
         ublob = layer['digest']
-
-        # FIXME: Creating fake layer ID. Don't know how Docker generates it
-        fake_layerid = "{parentid}\n"
-        fake_layerid += "{ublob}\n"
-        fake_layerid = fake_layerid.encode('utf-8')
-        fake_layerid = hashlib.sha256(fake_layerid)
-        fake_layerid = fake_layerid.hexdigest()
+        fake_layerid = get_fake_layerid()
 
         base_path = pathlib.Path(__file__).absolute().parent
         layerdir = base_path / imgdir / fake_layerid
@@ -300,7 +310,7 @@ def func_layers(layers):
         auth_type = 'application/vnd.docker.distribution.manifest.v2+json'
         auth_head = get_auth_head(url_data)
 
-        url = 'https://{registry}/v2/{url_data.repository}/blobs/{ublob}'
+        url = f"{image_data.blobs_url}/{ublob}"
         bresp = requests.get(url, headers=auth_head, stream=True, verify=False)
 
         # When the layer is located at a custom URL
@@ -312,7 +322,7 @@ def func_layers(layers):
         nb_traits = 0
         progress_bar(ublob, nb_traits)
 
-        save_chunks(layerdir, bresp, nb_traits)
+        save_chunks(layerdir, bresp, ublob, nb_traits)
 
         # Ugly but works everywhere
         msg = f"\r{ublob[7:19]}: Extracting...{' '*50}"
@@ -320,13 +330,15 @@ def func_layers(layers):
         sys.stdout.flush()
 
         # Decompress gzip response
-        with open(layerdir + '/layer.tar', "wb") as file:
-            filename = layerdir + '/layer_gzip.tar'
-            unzLayer = gzip.open(filename, 'rb')
+        layer_tar_file = layerdir / 'layer.tar'
+        layer_gzip_file = layerdir / 'layer_gzip.tar'
+
+        with open(layer_tar_file, "wb") as file:
+            unzLayer = gzip.open(layer_gzip_file, 'rb')
             shutil.copyfileobj(unzLayer, file)
             unzLayer.close()
 
-        os.remove(layerdir + '/layer_gzip.tar')
+        layer_gzip_file.unlink()
         msg = (
             f"\r{ublob[7:19],}: Pull complete "
             f"[{bresp.headers['Content-Length']}]"
@@ -340,6 +352,7 @@ def func_layers(layers):
 
             # FIXME: json.loads() automatically converts to unicode, thus
             # decoding values whereas Docker doesn't
+
             json_obj = json.loads(confresp.content)
             del json_obj['history']
             try:
@@ -357,8 +370,45 @@ def func_layers(layers):
         parentid = json_obj['id']
 
         # Creating json file
-        with open(layerdir + '/json', 'w') as file:
-            file.write(json.dumps(json_obj))
+        json_file = layerdir / 'json'
+        with open(json_file, 'w') as file:
+            json.dump(json_obj, file)
+
+    return fake_layerid
+
+def save_image_tar(repo, img, imgdir):
+
+    # Create image tar and clean tmp folder
+    docker_tar = repo.replace('/', '_') + '_' + img + '.tar'
+    sys.stdout.write("Creating archive...")
+    sys.stdout.flush()
+
+    tar = tarfile.open(docker_tar, "w")
+    tar.add(imgdir, arcname=os.path.sep)
+    tar.close()
+
+
+def get_content_json(image_data, fake_layerid):
+
+    imgparts = image_data.imgparts
+    img = image_data.img
+    tag = image_data.tag
+
+    if len(imgparts[:-1]) != 0:
+        content = {
+            '/'.join(imgparts[:-1]) + '/' + img : {
+                tag : fake_layerid
+            }
+        }
+
+    else:  # when pulling only an img (without repo and registry)
+        content = {
+            img: {
+                tag: fake_layerid
+            }
+        }
+
+    return content
 
 
 CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help'])
@@ -389,11 +439,11 @@ def main(image):
     layers = resp.json()['layers']
 
     # Create tmp folder that will hold the image
-    print(f'Creating image structure in: {imgdir}')
-    img_tag = tag.replace(':', '@')
+    img_tag = image_data.tag.replace(':', '@')
     basedir = pathlib.Path(__file__).absolute().parent
-    imgdir = basedir / f"tmp_{img}_{img_tag}"
+    imgdir = basedir / f"tmp_{image_data.img}_{img_tag}"
     imgdir.mkdir()
+    print(f'Creating image structure in: {imgdir}')
 
     config = resp.json()
     config = config['config']['digest']
@@ -416,43 +466,34 @@ def main(image):
     if len(image_data.imgparts[:-1]) != 0:
         path = '/'.join(imgparts[:-1]) + '/' + img + ':' + tag
     else:
-        path = img + ':' + tag
+        path = image_data.img + ':' + image_data.tag
 
     content[0]['RepoTags'].append(path)
     empty_json = get_base_json()
-    func_layers(layers)
+    fake_layerid = func_layers(
+        layers,
+        url_data,
+        image_data,
+        imgdir,
+        content,
+        confresp
+    )
 
-    with open(imgdir + '/manifest.json', 'w') as file:
+    manifest_file = imgdir / 'manifest.json'
+    with open(manifest_file, 'w') as file:
         file.write(json.dumps(content))
 
-    if len(imgparts[:-1]) != 0:
+    content = get_content_json(image_data, fake_layerid)
 
-        content = {
-            '/'.join(imgparts[:-1]) + '/' + img : {
-                tag : fake_layerid
-            }
-        }
-
-    else:  # when pulling only an img (without repo and registry)
-        content = {
-            img: {
-                tag: fake_layerid
-            }
-        }
-
-    with open(imgdir + '/repositories', 'w') as file:
+    repositories_file = imgdir / 'repositories'
+    with open(repositories_file, 'w') as file:
         json.dump(content, file)
 
-    # Create image tar and clean tmp folder
-    docker_tar = repo.replace('/', '_') + '_' + img + '.tar'
-    sys.stdout.write("Creating archive...")
-    sys.stdout.flush()
+    save_image_tar(image_data.repo, image_data.img, imgdir)
 
-    tar = tarfile.open(docker_tar, "w")
-    tar.add(imgdir, arcname=os.path.sep)
-    tar.close()
-
+    # clean up
     shutil.rmtree(imgdir)
+
     print('\rDocker image pulled: {docker_tar}')
 
 
