@@ -3,30 +3,71 @@
 import os
 import sys
 import gzip
-from io import BytesIO
 import json
 import hashlib
 import shutil
 import requests
 import tarfile
 import urllib3
+import pathlib
+
+from argparse import ArgumentParser
+from io import BytesIO
+
+import click
+
 urllib3.disable_warnings()
+CHUNK_SIZE = 8192
 
 
-def get_auth_head(auth_url, reg_service, repository, auth_type):
+@dataclass
+class URLData:
+    auth_url: str
+    reg_service: str
+    repository: str
+    auth_type: str
+
+
+@dataclass
+class ImageData
+    imgparts: str
+    registry: str
+    repo: str
+    img: str
+    tag: str
+    repository: str
+
+    @property
+    def base_url(self):
+        return f'https://{self.registry}/v2'
+
+    @property
+    def manifest_url(self):
+        return f'{self.base_url}/{repository}/manifests/{tag}'
+
+    @property
+    def blobs_url(self):
+        return f'{self.base_url}/{repository}/blobs'
+
+def get_auth_head(url_data):
     """Get Docker token.
 
     NOTE: this function is useless for unauthenticated registries like
     Microsoft
     """
 
-    url = f'{auth_url}?service={reg_service}&scope=repository:{repository}:pull'
+    url = (
+        f'{url_data.auth_url}'
+        f'?service={url_data.reg_service}'
+        f'&scope=repository:{url_data.repository}:pull'
+    )
+
     resp = requests.get(url, verify=False)
     access_token = resp.json()['token']
 
     auth_head = {
         'Authorization': f'Bearer {access_token}',
-        'Accept': auth_type,
+        'Accept': url_data.auth_type,
     }
 
     return auth_head
@@ -53,21 +94,24 @@ def progress_bar(ublob, nb_traits):
     sys.stdout.flush()
 
 
-def main():
+def build_options():
 
     # TODO: move to argparse or click?
     if len(sys.argv) != 2 :
         print(
             'Usage:\n'
-            '\tdocker_pull.py [registry/][repository/]image[:tag|@digest]\n'
+            '\tdocker_pull.py \n'
         )
         sys.exit(1)
+
+
+def parse_image(image):
 
     # Look for the Docker image to download
     repo = 'library'
     tag = 'latest'
-    imgparts = sys.argv[1].split('/')
 
+    imgparts = image.split('/')
     try:
         img, tag = imgparts[-1].split('@')
     except ValueError:
@@ -81,6 +125,7 @@ def main():
     if len(imgparts) > 1 and ('.' in imgparts[0] or ':' in imgparts[0]):
         registry = imgparts[0]
         repo = '/'.join(imgparts[1:-1])
+
     else:
         registry = 'registry-1.docker.io'
         if len(imgparts[:-1]) != 0:
@@ -90,12 +135,77 @@ def main():
 
     repository = f'{repo}/{img}'
 
+    return ImageData(imgparts, registry, repo, img, tag, repository)
+
+
+def manifest_error(resp, url_data, image_data):
+
+    print(
+        f'[-] Cannot fetch manifest for {url_data.repository} '
+        f'[HTTP {resp.status_code}]'
+    )
+    print(resp.content)
+
+    auth_type = 'application/vnd.docker.distribution.manifest.list.v2+json'
+    url_data.auth_type = auth_type
+    auth_head = get_auth_head(url_data)
+
+    url = f'https://{registry}/v2/{image_data.repository}/manifests/{tag}'
+    resp = requests.get(url, headers=auth_head, verify=False)
+
+    if (resp.status_code == 200):
+        print(
+            '[+] Manifests found for this tag (use the @digest format to '
+            'pull the corresponding image):'
+        )
+
+        manifests = resp.json()['manifests']
+        for manifest in manifests:
+            for key, value in manifest["platform"].items():
+                sys.stdout.write(f'{key}: {value}, ')
+
+            print(f'digest: {manifest["digest"]}')
+
+    sys.exit(1)
+
+
+def get_base_dict():
+
+    container_config: {
+        "Hostname": "",
+        "Domainname": "",
+        "User": "",
+        "AttachStdin": False,
+        "AttachStdout": False,
+        "AttachStderr": False,
+        "Tty": False,
+        "OpenStdin": False,
+        "StdinOnce": False,
+        "Env": None,
+        "Cmd": None,
+        "Image": "",
+        "Volumes": None,
+        "WorkingDir": "",
+        "Entrypoint": None,
+        "OnBuild": None,
+        "Labels": None,
+    }
+
+    empty_dict = {
+        "created": "1970-01-01T00:00:00Z",
+        "container_config":  container_config,
+    }
+
+    return json.dumps(empty_dict)
+
+def get_url_data(image_data):
+
     # Get Docker authentication endpoint when it is required
     auth_url='https://auth.docker.io/token'
     reg_service='registry.docker.io'
 
-    url = f'https://{registry}/v2/'
-    resp = requests.get(url, verify=False)
+    resp = requests.get(image_data.base_url, verify=False)
+
     if resp.status_code == 401:
         auth_url = resp.headers['WWW-Authenticate'].split('"')[1]
         try:
@@ -105,108 +215,81 @@ def main():
 
     # Fetch manifest v2 and get image layer digests
     auth_type = 'application/vnd.docker.distribution.manifest.v2+json'
-    auth_head = get_auth_head(auth_url, reg_service, repository, auth_type)
 
-    url = f'https://{registry}/v2/{repository}/manifests/{tag}'
-    resp = requests.get(url, headers=auth_head, verify=False)
+    url_data = URLData(
+        auth_url=auth_url,
+        reg_service=reg_service,
+        repository=repository,
+        auth_type=auth_type,
+    )
+
+    return url_data
+
+def save_chunks(layerdir, bresp, nb_traits):
+
+    unit = int(bresp.headers['Content-Length']) / 50
+    acc = 0
+
+    with open(layerdir + '/layer_gzip.tar', "wb") as file:
+
+        for chunk in bresp.iter_content(chunk_size=CHUNK_SIZE):
+
+            if not chunk:
+                continue
+
+            file.write(chunk)
+            acc = acc + CHUNK_SIZE
+            if acc > unit:
+                nb_traits = nb_traits + 1
+                progress_bar(ublob, nb_traits)
+                acc = 0
 
 
-    if (resp.status_code != 200):
+def layer_error(layer, auth_head):
 
-        print(
-            f'[-] Cannot fetch manifest for {repository} '
-            f'[HTTP {resp.status_code}]'
-        )
-        print(resp.content)
+    bresp = requests.get(
+        layer['urls'][0],
+        headers=auth_head,
+        stream=True,
+        verify=False
+    )
 
-        auth_type = 'application/vnd.docker.distribution.manifest.list.v2+json'
-        auth_head = get_auth_head(auth_url, reg_service, repository, auth_type)
+    if bresp.status_code == 200:
+        return bresp
 
-        url = f'https://{registry}/v2/{repository}/manifests/{tag}'
-        resp = requests.get(url, headers=auth_head, verify=False)
+    err_msg = (
+        f'\rERROR: Cannot download layer {ublob[7:19]} '
+        f'[HTTP {bresp.status_code}]'
+    )
+    print(err_msg)
+    print(bresp.content)
+    sys.exit(1)
 
-        if (resp.status_code == 200):
-            print(
-                '[+] Manifests found for this tag (use the @digest format to '
-                'pull the corresponding image):'
-            )
 
-            manifests = resp.json()['manifests']
-            for manifest in manifests:
-                for key, value in manifest["platform"].items():
-                    sys.stdout.write(f'{key}: {value}, ')
+def func_layers(layers):
 
-                print(f'digest: {manifest["digest"]}')
-
-        sys.exit(1)
-
-    layers = resp.json()['layers']
-
-    # Create tmp folder that will hold the image
-
-    # TODO: Fix this string
-    imgdir = f"tmp_{img}_{tag.replace(':', '@')}"
-    os.mkdir(imgdir)
-    print('Creating image structure in: {imgdir}')
-
-    config = resp.json()['config']['digest']
-    url = f'https://{registry}/v2/{repository}/blobs/{config}'
-    confresp = requests.get(url, headers=auth_head, verify=False)
-
-    filename = f'{imgdir}/{config[7:]}.json'
-    with open(filename, 'wb') as file:
-        file.write(confresp.content)
-
-    content = [{
-        'Config': config[7:] + '.json',
-        'RepoTags': [],
-        'Layers': [],
-    }]
-
-    if len(imgparts[:-1]) != 0:
-        content[0]['RepoTags'].append('/'.join(imgparts[:-1]) + '/' + img + ':' + tag)
-    else:
-        content[0]['RepoTags'].append(img + ':' + tag)
-
-    empty_dict = {
-        "created": "1970-01-01T00:00:00Z",
-        "container_config": {
-            "Hostname": "",
-            "Domainname": "",
-            "User": "",
-            "AttachStdin": False,
-            "AttachStdout": False,
-            "AttachStderr": False,
-            "Tty": False,
-            "OpenStdin": False,
-            "StdinOnce": False,
-            "Env": None,
-            "Cmd": None,
-            "Image": "",
-            "Volumes": None,
-            "WorkingDir": "",
-            "Entrypoint": None,
-            "OnBuild": None,
-            "Labels": None
-        }
-    }
-
-    empty_json = json.dumps(empty_dict)
+    # TODO: better function name...
 
     # Build layer folders
-    parentid=''
+    parentid = ''
     for layer in layers:
 
         ublob = layer['digest']
+
         # FIXME: Creating fake layer ID. Don't know how Docker generates it
-        fake_layerid = hashlib.sha256((parentid+'\n'+ublob+'\n').encode('utf-8'))
+        fake_layerid = "{parentid}\n"
+        fake_layerid += "{ublob}\n"
+        fake_layerid = fake_layerid.encode('utf-8')
+        fake_layerid = hashlib.sha256(fake_layerid)
         fake_layerid = fake_layerid.hexdigest()
 
-        layerdir = imgdir + '/' + fake_layerid
-        os.mkdir(layerdir)
+        base_path = pathlib.Path(__file__).absolute().parent
+        layerdir = base_path / imgdir / fake_layerid
+        layerdir.mkdir()
 
         # Creating VERSION file
-        with open(layerdir + '/VERSION', 'w') as file:
+        layer_version = layerdir / 'VERSION'
+        with open(layer_version, 'w') as file:
             file.write('1.0')
 
         # Creating layer.tar file
@@ -215,50 +298,21 @@ def main():
 
         # refreshing token to avoid its expiration
         auth_type = 'application/vnd.docker.distribution.manifest.v2+json'
-        auth_head = get_auth_head(auth_url, reg_service, repository, auth_type)
+        auth_head = get_auth_head(url_data)
 
-        url = 'https://{registry}/v2/{repository}/blobs/{ublob}'
+        url = 'https://{registry}/v2/{url_data.repository}/blobs/{ublob}'
         bresp = requests.get(url, headers=auth_head, stream=True, verify=False)
 
         # When the layer is located at a custom URL
         if bresp.status_code != 200:
-
-            bresp = requests.get(
-                layer['urls'][0],
-                headers=auth_head,
-                stream=True,
-                verify=False
-            )
-
-            if (bresp.status_code != 200):
-                err_msg = (
-                    '\rERROR: Cannot download layer {ublob[7:19]} '
-                    '[HTTP {bresp.status_code}]'
-                )
-                print(err_msg)
-                print(bresp.content)
-                sys.exit(1)
+            bresp = layer_error(layer, auth_head)
 
         # Stream download and follow the progress
         bresp.raise_for_status()
-        unit = int(bresp.headers['Content-Length']) / 50
-        acc = 0
         nb_traits = 0
         progress_bar(ublob, nb_traits)
 
-        CHUNK_SIZE = 8192
-        with open(layerdir + '/layer_gzip.tar', "wb") as file:
-            for chunk in bresp.iter_content(chunk_size=CHUNK_SIZE):
-
-                if not chunk:
-                    continue
-
-                file.write(chunk)
-                acc = acc + CHUNK_SIZE
-                if acc > unit:
-                    nb_traits = nb_traits + 1
-                    progress_bar(ublob, nb_traits)
-                    acc = 0
+        save_chunks(layerdir, bresp, nb_traits)
 
         # Ugly but works everywhere
         msg = f"\r{ublob[7:19]}: Extracting...{' '*50}"
@@ -306,10 +360,73 @@ def main():
         with open(layerdir + '/json', 'w') as file:
             file.write(json.dumps(json_obj))
 
+
+CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help'])
+
+@click.command(no_args_is_help=True, context_settings=CONTEXT_SETTINGS)
+@click.argument("image")
+def main(image):
+    """Download a docker image.
+
+    \b
+    Usage:
+        [registry/][repository/]image[:tag|@digest]
+    """
+
+    image_data = parse_image(image)
+    url_data = get_url_data(image_data)
+    auth_head = get_auth_head(url_data)
+
+    resp = requests.get(
+        image_data.manifest_url,
+        headers=auth_head,
+        verify=False
+    )
+
+    if resp.status_code != 200:
+        manifest_error(resp, url_data, image_data)
+
+    layers = resp.json()['layers']
+
+    # Create tmp folder that will hold the image
+    print(f'Creating image structure in: {imgdir}')
+    img_tag = tag.replace(':', '@')
+    basedir = pathlib.Path(__file__).absolute().parent
+    imgdir = basedir / f"tmp_{img}_{img_tag}"
+    imgdir.mkdir()
+
+    config = resp.json()
+    config = config['config']['digest']
+    config_base = config[7:]
+
+    url = f'{image_data.blobs_url}/{config}'
+    confresp = requests.get(url, headers=auth_head, verify=False)
+
+    filename = f'{imgdir}/{config_base}.json'
+    with open(filename, 'wb') as file:
+        file.write(confresp.content)
+
+    content = {
+        'Config': f'{config_base}.json',
+        'RepoTags': [],
+        'Layers': [],
+    }
+    content = [content]
+
+    if len(image_data.imgparts[:-1]) != 0:
+        path = '/'.join(imgparts[:-1]) + '/' + img + ':' + tag
+    else:
+        path = img + ':' + tag
+
+    content[0]['RepoTags'].append(path)
+    empty_json = get_base_json()
+    func_layers(layers)
+
     with open(imgdir + '/manifest.json', 'w') as file:
         file.write(json.dumps(content))
 
     if len(imgparts[:-1]) != 0:
+
         content = {
             '/'.join(imgparts[:-1]) + '/' + img : {
                 tag : fake_layerid
@@ -317,7 +434,11 @@ def main():
         }
 
     else:  # when pulling only an img (without repo and registry)
-        content = { img : { tag : fake_layerid } }
+        content = {
+            img: {
+                tag: fake_layerid
+            }
+        }
 
     with open(imgdir + '/repositories', 'w') as file:
         json.dump(content, file)
@@ -333,3 +454,7 @@ def main():
 
     shutil.rmtree(imgdir)
     print('\rDocker image pulled: {docker_tar}')
+
+
+if __name__ == "__main__":
+    main()
